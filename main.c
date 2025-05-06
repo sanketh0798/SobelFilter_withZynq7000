@@ -1,0 +1,156 @@
+#include <stdio.h>
+#include "platform.h"
+#include "xil_printf.h"
+#include "xparameters.h" // Contains hardware addresses/definitions
+#include "xgpio.h"       // Header for AXI GPIO driver
+#include "xil_io.h"      // For BRAM R/W
+#include <sleep.h>
+
+// Define GPIO Device IDs from xparameters.h
+#define GPIO_CTRL_DEVICE_ID  1
+#define GPIO_CFG_DEVICE_ID   0
+
+// Define BRAM Addresses (Word Addresses)
+#define INPUT_BRAM_BASEADDR  0x40000000
+#define OUTPUT_BRAM_BASEADDR 0x40010000
+
+// Define GPIO Channels (assuming default dual channel for gpio_control)
+#define GPIO_CTRL_CHANNEL1   1 // Start/Mode Outputs
+#define GPIO_STATUS_CHANNEL2 2 // Busy/Done Inputs
+#define GPIO_CFG_CHANNEL1    1 // Width/Height Outputs
+
+// Control/Status bit definitions within GPIO channels
+#define START_BIT_MASK       0x01 // In GPIO_CTRL_CHANNEL1
+#define MODE_SHIFT           1    // In GPIO_CTRL_CHANNEL1
+#define MODE_MASK            (0x03 << MODE_SHIFT) // Bits 2:1
+#define BUSY_BIT_MASK        0x01 // In GPIO_STATUS_CHANNEL2
+#define DONE_BIT_MASK        0x02 // In GPIO_STATUS_CHANNEL2
+
+#define WIDTH_SHIFT          0
+#define WIDTH_MASK           0xFFFF // Bits 15:0 in GPIO_CFG_CHANNEL1
+#define HEIGHT_SHIFT         16
+#define HEIGHT_MASK          (0xFFFF << HEIGHT_SHIFT) // Bits 31:16
+
+// Image dimensions
+#define IMAGE_WIDTH  64
+#define IMAGE_HEIGHT 64
+#define IMAGE_SIZE_BYTES (IMAGE_WIDTH * IMAGE_HEIGHT)
+#define BRAM_DEPTH_WORDS (IMAGE_SIZE_BYTES / 4) // 1024 for 64x64
+
+// Sobel Modes
+#define MODE_GX      0
+#define MODE_GY      1
+#define MODE_COMBINED 2
+
+// GPIO Driver Instances
+XGpio GpioCtrl;
+XGpio GpioCfg;
+
+int main() {
+    init_platform();
+    xil_printf("-- Sobel Filter Test (AXI GPIO Control) --\n");
+
+    int Status;
+    u32 gpio_ctrl_val;
+    u32 gpio_cfg_val;
+    u32 gpio_status_val;
+
+    // Initialize GPIO drivers
+    Status = XGpio_Initialize(&GpioCtrl, GPIO_CTRL_DEVICE_ID);
+    if (Status != XST_SUCCESS) {
+        xil_printf("GPIO Control Init Failed\n");
+        return XST_FAILURE;
+    }
+    Status = XGpio_Initialize(&GpioCfg, GPIO_CFG_DEVICE_ID);
+    if (Status != XST_SUCCESS) {
+        xil_printf("GPIO Config Init Failed\n");
+        return XST_FAILURE;
+    }
+
+    // Set GPIO directions
+    // GpioCtrl: Channel 1 is Output (Start/Mode), Channel 2 is Input (Busy/Done)
+    XGpio_SetDataDirection(&GpioCtrl, GPIO_CTRL_CHANNEL1, 0x00000000); // All outputs
+    XGpio_SetDataDirection(&GpioCtrl, GPIO_STATUS_CHANNEL2, 0xFFFFFFFF); // All inputs
+    // GpioCfg: Channel 1 is Output (Width/Height)
+    XGpio_SetDataDirection(&GpioCfg, GPIO_CFG_CHANNEL1, 0x00000000); // All outputs
+
+
+    // --- Optional: Load test image data into 32-bit BRAM ---
+    xil_printf("Loading test image to Input BRAM (32-bit words)...\n");
+    u32 test_word = 0;
+    for (u32 i = 0; i < BRAM_DEPTH_WORDS; i++) {
+        // Pack 4 dummy pixels (e.g., gradient) into one word
+        u8 p0 = (i * 4 + 0) % 256;
+        u8 p1 = (i * 4 + 1) % 256;
+        u8 p2 = (i * 4 + 2) % 256;
+        u8 p3 = (i * 4 + 3) % 256;
+        test_word = (p3 << 24) | (p2 << 16) | (p1 << 8) | p0;
+        Xil_Out32(INPUT_BRAM_BASEADDR + (i * 4), test_word); // Write 32-bit word
+    }
+    xil_printf("Input BRAM loaded.\n");
+    // --- End Optional Load ---
+
+
+    // 1. Configure Sobel IP via GPIO
+    xil_printf("Configuring Sobel parameters via GPIO...\n");
+
+    // Set Width and Height (in GpioCfg)
+    gpio_cfg_val = ((IMAGE_HEIGHT << HEIGHT_SHIFT) & HEIGHT_MASK) |
+                   ((IMAGE_WIDTH << WIDTH_SHIFT) & WIDTH_MASK);
+    XGpio_DiscreteWrite(&GpioCfg, GPIO_CFG_CHANNEL1, gpio_cfg_val);
+    xil_printf(" Wrote Width=%d, Height=%d\n", IMAGE_WIDTH, IMAGE_HEIGHT);
+
+    // Set Mode and ensure Start is low (in GpioCtrl)
+    u32 mode_sel = MODE_COMBINED;
+    gpio_ctrl_val = (mode_sel << MODE_SHIFT) & MODE_MASK; // Set mode, start=0
+    XGpio_DiscreteWrite(&GpioCtrl, GPIO_CTRL_CHANNEL1, gpio_ctrl_val);
+    xil_printf(" Wrote Mode=%d, Start=0\n", mode_sel);
+    sleep(1); // Small delay
+
+
+    // 2. Start Sobel Processing (Pulse Start bit)
+    xil_printf("Starting Sobel Filter (pulsing GPIO Start bit)...\n");
+    // Assert Start
+    gpio_ctrl_val |= START_BIT_MASK;
+    XGpio_DiscreteWrite(&GpioCtrl, GPIO_CTRL_CHANNEL1, gpio_ctrl_val);
+    usleep(1); // Hold pulse briefly (optional, HW latches it)
+    // Deassert Start
+    gpio_ctrl_val &= ~START_BIT_MASK;
+    XGpio_DiscreteWrite(&GpioCtrl, GPIO_CTRL_CHANNEL1, gpio_ctrl_val);
+    xil_printf(" Start pulse sent.\n");
+
+
+    // 3. Poll for Completion using GPIO Status channel
+    xil_printf("Waiting for completion (polling GPIO Done bit)...\n");
+    do {
+        gpio_status_val = XGpio_DiscreteRead(&GpioCtrl, GPIO_STATUS_CHANNEL2);
+        // Optional: check busy flag
+        // if (gpio_status_val & BUSY_BIT_MASK) {
+        //    xil_printf(".");
+        // } else {
+        //     xil_printf(" "); // No longer busy?
+        // }
+        usleep(100); // Adjust delay
+    } while (!(gpio_status_val & DONE_BIT_MASK)); // Loop until Done bit (bit 1) is high
+
+    xil_printf("\nSobel processing DONE (Done bit set).\n");
+
+
+    // --- Optional: Read back processed image from 32-bit BRAM ---
+    xil_printf("Reading processed image from Output BRAM (32-bit words)...\n");
+    u32 processed_word;
+    xil_printf("First 10 output words (lowest byte shown):\n");
+    for(u32 i=0; i < 10 && i < BRAM_DEPTH_WORDS; i++){
+         processed_word = Xil_In32(OUTPUT_BRAM_BASEADDR + (i*4));
+         // Extract lowest byte (where our simplified RTL wrote the pixel)
+         u8 pixel_byte0 = (u8)(processed_word & 0xFF);
+         xil_printf("Word %d: 0x%08X (Byte0=%d) \n", i, processed_word, pixel_byte0);
+    }
+    xil_printf("\n");
+    // Note: Due to simplified RTL write, only byte 0 has valid data here.
+    // --- End Optional Read ---
+
+
+    cleanup_platform();
+    return 0;
+}
